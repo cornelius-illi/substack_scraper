@@ -1,5 +1,5 @@
 # Substack Scraper
-This scrapes Substack blogs for all their post content and outputs it into raw text files. This project was intended to create neural network training data.
+This scrapes Substack blogs for all their post content and outputs it into **markdown files**. It will also download the images from the blog and put them in an `attachments` folder for that blog. This project was intended to create neural network training data.
 
 *NOTE*: This project currently cannot get around subscriber-only Substack articles; it will output the truncated article text along with the subscriber message.
 
