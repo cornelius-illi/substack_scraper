@@ -1,12 +1,10 @@
 use reqwest;
-use html2text::from_read;
-use serde::{Deserialize, Serialize};
-use voca_rs::strip::strip_tags;
-use tokio::{macros, spawn};
-use futures::executor::block_on;
-use log::{debug, LevelFilter};
-use env_logger::{Builder, Target};
-use std::{env, fs, iter};
+use serde::{Deserialize};
+use regex::Regex;
+
+use log::{debug};
+use env_logger::Builder; // Added back
+
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
@@ -14,14 +12,15 @@ use std::thread::sleep;
 use chrono::Local;
 use scraper::{Html, Selector};
 
-use clap::{Parser, Subcommand};
-use clap::builder::TypedValueParser;
+use tokio::fs; // Added back
+
+use clap::{Parser};
 use color_eyre::eyre;
-use color_eyre::eyre::eyre;
 use env_logger::Target::Stdout;
-use futures::TryFutureExt;
-use fancy_regex::Regex;
+
 use reqwest::Url;
+use md5;
+use html2md;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -79,67 +78,119 @@ struct CanonicalUrl {
 async fn scrape(homepage_url: &Url) -> eyre::Result<()> {
     let post_urls = get_post_urls(homepage_url).await?;
 
-    let mut urls_to_post_content: Vec<(&Url, Vec<String>)> = Vec::new();
-
-    // Get posts' content.
-    for mut post_url in &post_urls {
-        let post = get_post_content(&post_url).await?;
-        urls_to_post_content.push((&post_url, post));
-    }
-
     let blog_folder_path = Path::new("blogs").join(Path::new(&homepage_url.host_str().unwrap()));
 
-    // Write to files.
-    for (url, post) in urls_to_post_content {
-        let path = Path::new(url.path());
+    for post_url in &post_urls {
+        let path = Path::new(post_url.path());
         let path = path.strip_prefix("/").unwrap_or(path);
-        let path = blog_folder_path.join(path);
-        if let Some(dir) = path.parent() {
-            fs_err::create_dir_all(dir)?;
+        let path_with_md_extension = blog_folder_path.join(path).with_extension("md");
+
+        if let Ok(metadata) = fs::metadata(&path_with_md_extension).await { // Use tokio::fs::metadata
+            if metadata.is_file() {
+                debug!("Skipping already scraped post: {}", post_url);
+                continue;
+            }
         }
-        fs_err::write(&path, post.join("\n").as_bytes())?;
+
+        let post_content = get_post_content(&post_url).await?;
+        process_and_save_post(&post_url, homepage_url, post_content).await?;
     }
     Ok(())
 }
 
 /// Get the text content of a post.
-async fn get_post_content(url: &Url) -> eyre::Result<Vec<String>> {
-    // TODO wait & retry getting content when hitting rate limit.
-    debug!("url is {:?}", url);
+async fn get_post_content(url: &Url) -> eyre::Result<String> {
+    debug!("Fetching post content for URL: {}", url);
 
-    let mut result = Vec::new();
     loop {
         let headers = reqwest::get(url.clone()).await?;
-        debug!("headers are {:?}", headers);
-        let mut body = headers.text().await?;
+        let body = headers.text().await?;
 
         let fragment = Html::parse_fragment(&body);
-        // The following selector looks for <p> elements with the .available-content parent.
-        let selector = Selector::parse(".available-content p:not(.button-wrapper)").unwrap();
-        for it in fragment.select(&selector) {
-            let temp = it.inner_html();
-            result.push(cleanup_content(&temp));
-        };
-        if !result.is_empty() { break };
-        // Wait on rate limiter.
+        // Broaden the selector to capture the entire content div.
+        // Based on analysis of Substack HTML, '.available-content' often contains the main post.
+        let selector = Selector::parse(".available-content").unwrap();
+
+        if let Some(main_content_element) = fragment.select(&selector).next() {
+            return Ok(main_content_element.inner_html());
+        }
+
+        debug!("No content found with selector. Retrying...");
         sleep(std::time::Duration::from_secs(1));
-        debug!("Retrying...");
     }
-    debug!("{:?}", result);
-    Ok(result)
 }
 
-/// Transform HTML into clean text output.
-fn cleanup_content(input: &String) -> String {
-    // Replace in-paragraph footnote links with "". Assumes that the following regex works.
-    let regex_footnote = Regex::new(r">\d</a>").unwrap();
-    let temp = regex_footnote.replace_all(&input, "></a>").to_string();
-    // Strip HTML tags.
-    let temp = strip_tags(&temp);
-    // Remove HTML encoding artifacts like ;nbsp;
-    let temp = from_read(temp.as_bytes(), 100);
-    let temp = temp.replace("\n", " ");
-    temp
+
+
+async fn process_and_save_post(
+    post_url: &Url,
+    homepage_url: &Url,
+    raw_html_content: String,
+) -> eyre::Result<()> {
+    debug!("Processing and saving post: {}", post_url);
+
+    let blog_host = homepage_url.host_str().unwrap_or("unknown_host");
+    let blog_folder_path = Path::new("blogs").join(blog_host);
+    let attachments_dir = blog_folder_path.join("attachments");
+
+    tokio::fs::create_dir_all(&attachments_dir).await?;
+
+    let fragment = Html::parse_fragment(&raw_html_content);
+    let mut img_replacements = Vec::new();
+    let img_selector = Selector::parse("img").unwrap();
+
+    for element_ref in fragment.select(&img_selector) {
+        if let Some(src) = element_ref.value().attr("src") {
+            let img_url = Url::parse(src)?;
+            let img_bytes = reqwest::get(img_url.clone()).await?.bytes().await?;
+
+            let img_filename = format!("{:x}", md5::compute(src.as_bytes()));
+            let img_extension = img_url
+                .path_segments()
+                .and_then(|segments| segments.last())
+                .and_then(|name| name.rsplit('.').next())
+                .unwrap_or("bin");
+
+            let local_img_path = attachments_dir.join(format!("{}.{}", img_filename, img_extension));
+
+            tokio::fs::write(&local_img_path, img_bytes).await?;
+            debug!("Downloaded image: {} to {:?}", img_url, local_img_path);
+
+            let relative_img_path = Path::new("../attachments")
+                .join(format!("{}.{}", img_filename, img_extension))
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            // Store original src and new relative path for replacement
+            img_replacements.push((src.to_string(), relative_img_path));
+        }
+    }
+
+    // Apply replacements to the HTML content string
+    let mut modified_html_content = raw_html_content;
+    for (original_src, new_src) in img_replacements {
+        // This is a simple string replacement; a more robust solution might involve re-rendering the DOM
+        // or using a more sophisticated HTML manipulation library if complex scenarios arise.
+        // For now, this assumes 'src' attributes are quoted and distinct enough.
+        modified_html_content = modified_html_content.replace(&format!("src=\"{}\"", original_src), &format!("src=\"{}\"", new_src));
+    }
+
+
+    // Convert modified HTML to Markdown
+    let markdown_content = html2md::parse_html(&modified_html_content);
+
+    // Post-process markdown to fix image links
+    let re = Regex::new(r#"\[\s*<img[^>]*src="([^"]+)"[^>]*>\s*\]\([^)]+\)"#).unwrap();
+    let markdown_content = re.replace_all(&markdown_content, "![]($1)").to_string();
+
+    // Save Markdown file
+    let post_file_path = blog_folder_path.join(post_url.path().strip_prefix("/").unwrap_or(post_url.path())).with_extension("md");
+    tokio::fs::create_dir_all(post_file_path.parent().unwrap()).await?;
+    tokio::fs::write(&post_file_path, markdown_content.as_bytes()).await?;
+    debug!("Saved markdown for post: {} to {:?}", post_url, post_file_path);
+
+    Ok(())
 }
 
 async fn get_post_urls(homepage_url: &Url) -> eyre::Result<HashSet<Url>> {
